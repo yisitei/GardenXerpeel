@@ -5,6 +5,7 @@
   "installCommand": "npm ci --omit=dev",
   "outputDirectory": "public",
   "rewrites": [
+    { "source": "/uploads/:filename", "destination": "/api/image?filename=:filename" },
     { "source": "/admin", "destination": "/index.html" },
     { "source": "/admin/:path*", "destination": "/index.html" },
     { "source": "/plants", "destination": "/index.html" },

@@ -4,6 +4,7 @@ import {
   ArrowLeft, CheckCircle, Image, Leaf, UploadSimple, WarningCircle,
 } from '@phosphor-icons/react';
 import { api, slugify } from '../lib/api.js';
+import { prepareImage, validateImage } from '../lib/image-upload.js';
 import LoadingState from '../components/LoadingState.jsx';
 
 const emptyForm = {
@@ -84,6 +85,18 @@ export default function AdminPlantFormPage() {
 
   function handleFile(event) {
     const selected = event.target.files?.[0] || null;
+    try {
+      if (selected) validateImage(selected);
+    } catch (err) {
+      event.target.value = '';
+      setFile(null);
+      setLocalPreview('');
+      setError(err.message);
+      setFieldErrors(current => ({ ...current, image: err.message }));
+      return;
+    }
+    setError('');
+    setFieldErrors(current => ({ ...current, image: undefined }));
     setFile(selected);
     if (selected) {
       const url = URL.createObjectURL(selected);
@@ -117,15 +130,16 @@ export default function AdminPlantFormPage() {
 
     setSaving(status);
     try {
-      const saved = isEdit
-        ? await api(`/api/admin-plant?id=${id}`, { method: 'PUT', body: payload })
-        : await api('/api/admin-plants', { method: 'POST', body: payload });
-
+      let body = payload;
       if (file) {
-        const body = new FormData();
-        body.append('image', file);
-        await api(`/api/admin-image?id=${saved.data.id}`, { method: 'POST', body });
+        const prepared = await prepareImage(file);
+        body = new FormData();
+        body.append('data', JSON.stringify(payload));
+        body.append('image', prepared);
       }
+      await api(isEdit ? `/api/admin-plant?id=${id}` : '/api/admin-plants', {
+        method: isEdit ? 'PUT' : 'POST', body,
+      });
 
       navigate('/admin/plants');
     } catch (err) {
@@ -365,7 +379,7 @@ export default function AdminPlantFormPage() {
               <span className="panel-icon" aria-hidden="true"><Image size={20} /></span>
               <div>
                 <h2>Foto utama</h2>
-                <p>JPG, PNG, atau WebP. Maksimal 5 MB.</p>
+                <p>JPG, PNG, atau WebP. Maksimal 5 MB. Foto diperkecil otomatis sebelum diunggah.</p>
               </div>
             </div>
 

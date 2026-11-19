@@ -47,7 +47,9 @@ export async function api(path, options = {}) {
 
   if (!response.ok) {
     throw new ApiError(
-      payload?.message || 'Terjadi kesalahan. Coba lagi sebentar lagi.',
+      payload?.message || (response.status === 413
+        ? 'Foto terlalu besar untuk diunggah. Pilih foto lebih kecil lalu coba lagi.'
+        : 'Terjadi kesalahan. Coba lagi sebentar lagi.'),
       response.status,
       payload?.errors || [],
     );

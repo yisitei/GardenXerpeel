@@ -8,7 +8,7 @@ import sharp from 'sharp';
 import { DatabaseSync } from 'node:sqlite';
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { mkdirSync, existsSync } from 'node:fs';
-import { unlink } from 'node:fs/promises';
+import { unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 
@@ -169,6 +169,7 @@ export async function createApp(options = {}) {
   const isProduction = (options.nodeEnv || process.env.NODE_ENV) === 'production';
   const trustProxy = options.trustProxy ?? process.env.TRUST_PROXY === '1';
   const sessionSecret = options.sessionSecret || process.env.SESSION_SECRET || 'digital-garden-mvp-session-secret-change-me';
+  const storage = options.storage || {};
   const uploadsDir = path.join(dataDir, 'uploads');
   const staticDir = options.staticDir ? path.resolve(options.staticDir) : null;
 
@@ -177,7 +178,7 @@ export async function createApp(options = {}) {
 
   const db = new DatabaseSync(path.join(dataDir, 'garden.db'));
   db.exec(`
-    PRAGMA journal_mode = WAL;
+    PRAGMA journal_mode = ${storage.enabled ? 'DELETE' : 'WAL'};
     PRAGMA foreign_keys = ON;
     PRAGMA busy_timeout = 5000;
     CREATE TABLE IF NOT EXISTS admins (
@@ -286,7 +287,7 @@ export async function createApp(options = {}) {
         defaultSrc: ["'self'"],
         scriptSrc: ["'self'"],
         styleSrc: ["'self'", "'unsafe-inline'"],
-        imgSrc: ["'self'", 'data:'],
+        imgSrc: ["'self'", 'data:', 'blob:'],
         fontSrc: ["'self'"],
         connectSrc: ["'self'"],
         objectSrc: ["'none'"],
@@ -308,7 +309,10 @@ export async function createApp(options = {}) {
     const id = params.get('id');
     let target;
 
-    if (pathname === '/api/dashboard') {
+    if (pathname === '/api/image' && params.get('filename')) {
+      target = `/uploads/${encodeURIComponent(params.get('filename'))}`;
+      params.delete('filename');
+    } else if (pathname === '/api/dashboard') {
       target = '/api/admin/dashboard';
     } else if (pathname === '/api/plant' && params.get('slug')) {
       target = `/api/plants/${encodeURIComponent(params.get('slug'))}`;
@@ -373,6 +377,73 @@ export async function createApp(options = {}) {
   }
 
   const writeGuard = [requireSameOrigin, requireAuth, requireCsrf];
+
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: MAX_IMAGE_BYTES, files: 1, fields: 1, fieldSize: 128 * 1024 },
+  });
+
+  function receiveImage(req, res, next) {
+    upload.single('image')(req, res, (error) => {
+      if (!error) return next();
+      const tooLarge = error.code === 'LIMIT_FILE_SIZE';
+      return res.status(tooLarge ? 413 : 422).json({
+        message: tooLarge ? 'Ukuran foto maksimal 5 MB.' : 'Foto tidak dapat diproses.',
+        errors: [{ field: 'image', message: tooLarge ? 'Ukuran foto maksimal 5 MB.' : 'Gunakan satu foto JPG, PNG, atau WebP.' }],
+      });
+    });
+  }
+
+  async function optimiseImage(file) {
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.mimetype)) {
+      throw new Error('Format foto harus JPG, PNG, atau WebP.');
+    }
+    try {
+      const input = sharp(file.buffer, { limitInputPixels: 40_000_000 });
+      const metadata = await input.metadata();
+      if (!ALLOWED_IMAGE_FORMATS.has(metadata.format)) throw new Error('Format gambar tidak didukung.');
+      return await input.rotate()
+        .resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true })
+        .webp({ quality: 82 }).toBuffer();
+    } catch {
+      throw new Error('File gambar tidak valid atau terlalu besar untuk diproses. Gunakan JPG, PNG, atau WebP.');
+    }
+  }
+
+  // Validate/decode before changing any plant data. A failed upload must not
+  // publish an incomplete record, nor make retries fail with duplicate slugs.
+  async function parsePlantRequest(req, res, next) {
+    if (req.is('multipart/form-data')) {
+      try { req.body = JSON.parse(req.body?.data || '{}'); }
+      catch { return res.status(422).json({ message: 'Format data tanaman tidak valid.' }); }
+      if (req.file) {
+        try { req.optimisedImage = await optimiseImage(req.file); }
+        catch (error) {
+          return res.status(422).json({ message: error.message, errors: [{ field: 'image', message: error.message }] });
+        }
+      }
+    }
+    return next();
+  }
+
+  async function storeImage(buffer, slug) {
+    const filename = `${slug}-${randomBytes(12).toString('hex')}.webp`;
+    await writeFile(path.join(uploadsDir, filename), buffer, { flag: 'wx' });
+    await storage.saveUpload?.(filename, buffer);
+    return `/api/image?filename=${filename}`;
+  }
+
+  function imageFilename(imagePath) {
+    const url = new URL(imagePath, appUrl);
+    return path.basename(url.searchParams.get('filename') || url.pathname);
+  }
+
+  async function removeImage(imagePath) {
+    if (!imagePath) return;
+    const filename = imageFilename(imagePath);
+    await unlink(path.join(uploadsDir, filename)).catch(() => {});
+    await storage.deleteUpload?.(filename).catch(() => {});
+  }
 
   const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -510,7 +581,7 @@ export async function createApp(options = {}) {
     res.json({ data: adminPlant(plant) });
   });
 
-  app.post('/api/admin/plants', ...writeGuard, (req, res) => {
+  app.post('/api/admin/plants', ...writeGuard, receiveImage, parsePlantRequest, async (req, res) => {
     const result = validatePlantPayload(req.body);
     if (result.error) {
       return res.status(422).json({ message: result.error, errors: result.details });
@@ -518,21 +589,24 @@ export async function createApp(options = {}) {
     const data = result.data;
     const stamp = nowIso();
     const qrUrl = `${appUrl}/plants/${data.slug}`;
+    let imagePath;
     try {
+      imagePath = req.optimisedImage ? await storeImage(req.optimisedImage, data.slug) : null;
       const inserted = db.prepare(`
         INSERT INTO plants
           (slug, name, scientific_name, short_description, description, characteristics,
-           benefits, care_guide, habitat, location_label, qr_url, status, verified_at, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           benefits, care_guide, habitat, location_label, qr_url, status, verified_at, created_at, updated_at, image_path)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         data.slug, data.name, data.scientific_name || '', data.short_description || '',
         data.description || '', data.characteristics || '', data.benefits || '',
         data.care_guide || '', data.habitat || '', data.location_label || '', qrUrl,
-        data.status, data.status === 'published' ? stamp : null, stamp, stamp,
+        data.status, data.status === 'published' ? stamp : null, stamp, stamp, imagePath,
       );
       const plant = findPlantById.get(Number(inserted.lastInsertRowid));
       return res.status(201).json({ data: adminPlant(plant), message: 'Tanaman berhasil disimpan.' });
     } catch (error) {
+      await removeImage(imagePath);
       if (String(error?.message || '').includes('UNIQUE')) {
         return res.status(409).json({
           message: 'Slug sudah digunakan oleh tanaman lain.',
@@ -543,7 +617,7 @@ export async function createApp(options = {}) {
     }
   });
 
-  app.put('/api/admin/plants/:id', ...writeGuard, (req, res) => {
+  app.put('/api/admin/plants/:id', ...writeGuard, receiveImage, parsePlantRequest, async (req, res) => {
     const existing = plantOr404(req, res);
     if (!existing) return;
     const result = validatePlantPayload(req.body, { existing });
@@ -555,79 +629,60 @@ export async function createApp(options = {}) {
     const verifiedAt = data.status === 'published'
       ? (existing.verified_at || stamp)
       : existing.verified_at;
-    db.prepare(`
+    const imagePath = req.optimisedImage ? await storeImage(req.optimisedImage, existing.slug) : existing.image_path;
+    try {
+      db.prepare(`
       UPDATE plants SET
         name = ?, scientific_name = ?, short_description = ?, description = ?,
         characteristics = ?, benefits = ?, care_guide = ?, habitat = ?,
-        location_label = ?, status = ?, verified_at = ?, updated_at = ?
+        location_label = ?, status = ?, verified_at = ?, updated_at = ?, image_path = ?
       WHERE id = ?
     `).run(
       data.name, data.scientific_name || '', data.short_description || '',
       data.description || '', data.characteristics || '', data.benefits || '',
       data.care_guide || '', data.habitat || '', data.location_label || '',
-      data.status, verifiedAt, stamp, existing.id,
+      data.status, verifiedAt, stamp, imagePath, existing.id,
     );
+    } catch (error) {
+      if (req.optimisedImage) await removeImage(imagePath);
+      throw error;
+    }
+    if (req.optimisedImage) await removeImage(existing.image_path);
     res.json({ data: adminPlant(findPlantById.get(Number(existing.id))), message: 'Perubahan disimpan.' });
   });
 
-  app.delete('/api/admin/plants/:id', ...writeGuard, (req, res) => {
+  app.delete('/api/admin/plants/:id', ...writeGuard, async (req, res) => {
     const plant = plantOr404(req, res);
     if (!plant) return;
     db.prepare('DELETE FROM plants WHERE id = ?').run(plant.id);
-    if (plant.image_path) {
-      const file = path.join(uploadsDir, path.basename(plant.image_path));
-      unlink(file).catch(() => {});
-    }
+    await removeImage(plant.image_path);
     res.json({ message: 'Tanaman dihapus.' });
-  });
-
-  const upload = multer({
-    storage: multer.memoryStorage(),
-    limits: { fileSize: MAX_IMAGE_BYTES, files: 1 },
   });
 
   app.post('/api/admin/plants/:id/image', ...writeGuard, (req, res, next) => {
     const plant = plantOr404(req, res);
     if (!plant) return;
     req.plant = plant;
-    upload.single('image')(req, res, (error) => {
-      if (error) {
-        if (error.code === 'LIMIT_FILE_SIZE') {
-          return res.status(413).json({ message: 'Ukuran foto maksimal 5 MB.' });
-        }
-        return res.status(422).json({ message: 'Foto tidak dapat diproses.' });
-      }
-      return next();
-    });
+    return receiveImage(req, res, next);
   }, async (req, res) => {
     if (!req.file) {
       return res.status(422).json({ message: 'Pilih file foto terlebih dahulu.' });
     }
-    if (!['image/jpeg', 'image/png', 'image/webp'].includes(req.file.mimetype)) {
-      return res.status(422).json({ message: 'Format foto harus JPG, PNG, atau WebP.' });
-    }
-    let metadata;
+    let buffer;
     try {
-      metadata = await sharp(req.file.buffer, { failOn: 'none' }).metadata();
-    } catch {
-      return res.status(422).json({ message: 'File gambar tidak valid.' });
+      buffer = await optimiseImage(req.file);
+    } catch (error) {
+      return res.status(422).json({ message: error.message });
     }
-    if (!ALLOWED_IMAGE_FORMATS.has(metadata.format)) {
-      return res.status(422).json({ message: 'Format foto harus JPG, PNG, atau WebP.' });
+    const imagePath = await storeImage(buffer, req.plant.slug);
+    try {
+      db.prepare('UPDATE plants SET image_path = ?, updated_at = ? WHERE id = ?')
+        .run(imagePath, nowIso(), req.plant.id);
+    } catch (error) {
+      await removeImage(imagePath);
+      throw error;
     }
-    const filename = `${req.plant.slug}-${Date.now()}.webp`;
-    const destination = path.join(uploadsDir, filename);
-    await sharp(req.file.buffer, { failOn: 'none' })
-      .rotate()
-      .resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true })
-      .webp({ quality: 82 })
-      .toFile(destination);
-    const imagePath = `/uploads/${filename}`;
-    db.prepare('UPDATE plants SET image_path = ?, updated_at = ? WHERE id = ?')
-      .run(imagePath, nowIso(), req.plant.id);
-    if (req.plant.image_path) {
-      unlink(path.join(uploadsDir, path.basename(req.plant.image_path))).catch(() => {});
-    }
+    await removeImage(req.plant.image_path);
     res.json({
       data: adminPlant(findPlantById.get(Number(req.plant.id))),
       message: 'Foto tanaman berhasil diperbarui.',
@@ -654,10 +709,11 @@ export async function createApp(options = {}) {
     res.type('text/plain; charset=utf-8').send(svg);
   });
 
-  app.get('/uploads/:filename', (req, res) => {
+  app.get('/uploads/:filename', async (req, res) => {
     const filename = path.basename(String(req.params.filename || ''));
-    const imagePath = `/uploads/${filename}`;
-    const plant = db.prepare('SELECT id, status FROM plants WHERE image_path = ?').get(imagePath);
+    const imagePath = `/api/image?filename=${filename}`;
+    const plant = db.prepare('SELECT id, status FROM plants WHERE image_path = ? OR image_path = ?')
+      .get(imagePath, `/uploads/${filename}`);
     if (!plant) {
       return res.status(404).json({ message: 'Foto tidak ditemukan.' });
     }
@@ -666,12 +722,17 @@ export async function createApp(options = {}) {
     }
     const filePath = path.join(uploadsDir, filename);
     if (!existsSync(filePath)) {
+      const remote = await storage.readUpload?.(filename).catch(() => null);
+      if (remote) {
+        res.setHeader('Cache-Control', 'private, no-store');
+        return res.type('image/webp').send(remote);
+      }
       return res.status(404).json({ message: 'Foto tidak ditemukan.' });
     }
     return res.sendFile(filePath, {
       dotfiles: 'allow',
       headers: {
-        'Cache-Control': plant.status === 'published' ? 'public, max-age=3600' : 'private, no-store',
+        'Cache-Control': 'private, no-store',
       },
     }, (error) => {
       if (error && !res.headersSent) {
